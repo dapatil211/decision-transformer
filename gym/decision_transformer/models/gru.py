@@ -1,28 +1,19 @@
-import numpy as np
-import torch
-import torch.nn as nn
-
-import transformers
-
 from decision_transformer.models.model import TrajectoryModel
-from decision_transformer.models.trajectory_gpt2 import GPT2Model
+import torch
 
 
-class DecisionTransformer(TrajectoryModel):
-
-    """
-    This model uses GPT to model (Return_1, state_1, action_1, Return_2, state_2, ...)
-    """
-
+class GRUModel(TrajectoryModel):
     def __init__(
         self,
         state_dim,
         act_dim,
         hidden_size,
+        max_length,
         test_max_length=-1,
-        max_length=None,
         max_ep_len=4096,
         action_tanh=True,
+        use_time_encoding=False,
+        use_attention=False,
         shuffle=False,
         shuffle_last=False,
         **kwargs
@@ -33,32 +24,25 @@ class DecisionTransformer(TrajectoryModel):
         else:
             self.test_max_length = test_max_length
         self.hidden_size = hidden_size
+        self.use_time_encoding = use_time_encoding
+        self.use_attention = use_attention
         self.shuffle = shuffle
         self.shuffle_last = shuffle_last
 
-        config = transformers.GPT2Config(
-            vocab_size=1,  # doesn't matter -- we don't use the vocab
-            n_embd=hidden_size,
-            **kwargs
-        )
+        self.gru = torch.nn.GRU(hidden_size, hidden_size, **kwargs)
 
-        # note: the only difference between this GPT2Model and the default Huggingface version
-        # is that the positional embeddings are removed (since we'll add those ourselves)
-        self.transformer = GPT2Model(config)
-
-        self.embed_timestep = nn.Embedding(max_ep_len, hidden_size)
+        if self.use_time_encoding:
+            self.embed_timestep = torch.nn.Embedding(max_ep_len, hidden_size)
         self.embed_return = torch.nn.Linear(1, hidden_size)
         self.embed_state = torch.nn.Linear(self.state_dim, hidden_size)
         self.embed_action = torch.nn.Linear(self.act_dim, hidden_size)
+        self.embed_ln = torch.nn.LayerNorm(hidden_size)
 
-        self.embed_ln = nn.LayerNorm(hidden_size)
-
-        # note: we don't predict states or returns for the paper
         self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)
-        self.predict_action = nn.Sequential(
+        self.predict_action = torch.nn.Sequential(
             *(
-                [nn.Linear(hidden_size, self.act_dim)]
-                + ([nn.Tanh()] if action_tanh else [])
+                [torch.nn.Linear(hidden_size, self.act_dim)]
+                + ([torch.nn.Tanh()] if action_tanh else [])
             )
         )
         self.predict_return = torch.nn.Linear(hidden_size, 1)
@@ -73,34 +57,35 @@ class DecisionTransformer(TrajectoryModel):
         attention_mask=None,
         tlens=None,
     ):
-
         batch_size, seq_length = states.shape[0], states.shape[1]
-
-        if attention_mask is None:
-            # attention mask for GPT: 1 if can be attended to, 0 if not
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
-
-        # embed each modality with a different head
+        if tlens is None:
+            torch.full((batch_size,), seq_length)
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
         returns_embeddings = self.embed_return(returns_to_go)
-        time_embeddings = self.embed_timestep(timesteps)
-
         if self.shuffle:
+            # indices = torch.randperm()
+            range_tensor = (
+                torch.arange(seq_length).unsqueeze(0).expand(batch_size, seq_length)
+            )
+            mask = (
+                range_tensor >= tlens.unsqueeze(1)
+                if self.shuffle_last
+                else range_tensor > tlens.unsqueeze(1)
+            )
             rand_values = torch.rand(batch_size, seq_length)
-            rand_values = rand_values * attention_mask
-            if not self.shuffle_last:
-                rand_values[:, -1] = 1
+            rand_values[mask] = 1
             indices = torch.argsort(rand_values)
-            time_embeddings = time_embeddings[indices]
+            state_embeddings = state_embeddings[indices]
+            action_embeddings = action_embeddings[indices]
+            returns_embeddings = returns_embeddings[indices]
 
-        # time embeddings are treated similar to positional embeddings
-        state_embeddings = state_embeddings + time_embeddings
-        action_embeddings = action_embeddings + time_embeddings
-        returns_embeddings = returns_embeddings + time_embeddings
+        if self.use_time_encoding:
+            time_embeddings = self.embed_timestep(timesteps)
+            state_embeddings = state_embeddings + time_embeddings
+            action_embeddings = action_embeddings + time_embeddings
+            returns_embeddings = returns_embeddings + time_embeddings
 
-        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
-        # which works nice in an autoregressive sense since states predict actions
         stacked_inputs = (
             torch.stack(
                 (returns_embeddings, state_embeddings, action_embeddings), dim=1
@@ -108,27 +93,14 @@ class DecisionTransformer(TrajectoryModel):
             .permute(0, 2, 1, 3)
             .reshape(batch_size, 3 * seq_length, self.hidden_size)
         )
+
         stacked_inputs = self.embed_ln(stacked_inputs)
 
-        # to make the attention mask fit the stacked inputs, have to stack it as well
-        stacked_attention_mask = (
-            torch.stack((attention_mask, attention_mask, attention_mask), dim=1)
-            .permute(0, 2, 1)
-            .reshape(batch_size, 3 * seq_length)
+        gru_inputs = torch.nn.utils.rnn.pack_padded_sequence(
+            stacked_inputs, 3 * tlens, batch_first=True, enforce_sorted=False
         )
-
-        # we feed in the input embeddings (not word indices as in NLP) to the model
-        transformer_outputs = self.transformer(
-            inputs_embeds=stacked_inputs,
-            attention_mask=stacked_attention_mask,
-        )
-        x = transformer_outputs["last_hidden_state"]
-
-        # reshape x so that the second dimension corresponds to the original
-        # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
+        x = self.gru(gru_inputs)
         x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
-        # batch, rsa, seq_length, hidden
-        # get predictions
         return_preds = self.predict_return(
             x[:, 2]
         )  # predict next return given state and action
@@ -140,8 +112,7 @@ class DecisionTransformer(TrajectoryModel):
         return state_preds, action_preds, return_preds
 
     def get_action(self, states, actions, rewards, returns_to_go, timesteps, **kwargs):
-        # we don't care about the past rewards in this model
-
+        # these will come as tensors on the correct device
         states = states.reshape(1, -1, self.state_dim)
         actions = actions.reshape(1, -1, self.act_dim)
         returns_to_go = returns_to_go.reshape(1, -1, 1)
@@ -152,19 +123,10 @@ class DecisionTransformer(TrajectoryModel):
             actions = actions[:, -self.test_max_length :]
             returns_to_go = returns_to_go[:, -self.test_max_length :]
             timesteps = timesteps[:, -self.test_max_length :]
-
-            # pad all tokens to sequence length
-            attention_mask = torch.cat(
-                [
-                    torch.zeros(self.test_max_length - states.shape[1]),
-                    torch.ones(states.shape[1]),
-                ]
-            )
-            attention_mask = attention_mask.to(
-                dtype=torch.long, device=states.device
-            ).reshape(1, -1)
+            tlens = torch.tensor([states.shape[1]])
             states = torch.cat(
                 [
+                    states,
                     torch.zeros(
                         (
                             states.shape[0],
@@ -173,12 +135,12 @@ class DecisionTransformer(TrajectoryModel):
                         ),
                         device=states.device,
                     ),
-                    states,
                 ],
                 dim=1,
             ).to(dtype=torch.float32)
             actions = torch.cat(
                 [
+                    actions,
                     torch.zeros(
                         (
                             actions.shape[0],
@@ -187,12 +149,12 @@ class DecisionTransformer(TrajectoryModel):
                         ),
                         device=actions.device,
                     ),
-                    actions,
                 ],
                 dim=1,
             ).to(dtype=torch.float32)
             returns_to_go = torch.cat(
                 [
+                    returns_to_go,
                     torch.zeros(
                         (
                             returns_to_go.shape[0],
@@ -201,31 +163,34 @@ class DecisionTransformer(TrajectoryModel):
                         ),
                         device=returns_to_go.device,
                     ),
-                    returns_to_go,
                 ],
                 dim=1,
             ).to(dtype=torch.float32)
             timesteps = torch.cat(
                 [
+                    timesteps,
                     torch.zeros(
                         (timesteps.shape[0], self.test_max_length - timesteps.shape[1]),
                         device=timesteps.device,
                     ),
-                    timesteps,
                 ],
                 dim=1,
             ).to(dtype=torch.long)
         else:
-            attention_mask = None
-
+            tlens = None
         _, action_preds, return_preds = self.forward(
-            states,
-            actions,
-            None,
-            returns_to_go,
-            timesteps,
-            attention_mask=attention_mask,
-            **kwargs
+            states, actions, None, returns_to_go, timesteps, tlens=tlens, **kwargs
         )
-
         return action_preds[0, -1]
+
+
+# GRU
+#   get_batch - 1 hr
+#   rest of function - 15 mins
+#   testing - 1hr
+# shuffling
+#   get batch - 30 mins
+# vary context length
+#   get_batch - 15 mins
+# test time only use context = 1
+#   add test_max_length - 15 mins
